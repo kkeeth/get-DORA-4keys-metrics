@@ -1,79 +1,79 @@
 # DORA Metrics Calculator
 
-GitHub API を使用して DORA Four Keys メトリクスを計測するCLIツール。
+A CLI tool to measure DORA Four Keys metrics using the GitHub API.
 
-## DORA Four Keys とは
+## What is DORA Four Keys?
 
-DevOps Research and Assessment (DORA) が定義した、ソフトウェアデリバリーのパフォーマンスを測定する4つの主要指標。
+DORA Four Keys are the four key metrics defined by DevOps Research and Assessment (DORA) to measure software delivery performance.
 
-| メトリクス | 説明 | 本ツールでの定義 |
-|-----------|------|------------------|
-| **Deployment Frequency** | 本番環境へのデプロイ頻度 | mainブランチへのマージ回数 |
-| **Lead Time for Changes** | コミットから本番デプロイまでの時間 | PRの最初のコミット → マージまでの時間 |
-| **Change Failure Rate** | デプロイによる障害発生率 | hotfix/bugfix PR + bugラベル + revertの割合 |
-| **Time to Restore Service** | 障害からの復旧時間 | ※本ツールでは計測対象外 |
+| Metric | Description | Definition in this tool |
+|--------|-------------|------------------------|
+| **Deployment Frequency** | How often deploys to production | Number of merges to main branch |
+| **Lead Time for Changes** | Time from commit to production deploy | Time from first commit to PR merge |
+| **Change Failure Rate** | Percentage of deployments causing failures | Ratio of hotfix/bugfix PRs + bug labels + reverts |
+| **Time to Restore Service** | Time to recover from failures | *Not measured in this tool* |
 
-### 追加メトリクス
+### Additional Metrics
 
-| メトリクス | 説明 |
-|-----------|------|
-| **Time to First Review** | PR作成から最初のレビューまでの時間 |
+| Metric | Description |
+|--------|-------------|
+| **Time to First Review** | Time from PR creation to first review |
 
-## セットアップ
+## Setup
 
-### 1. ビルド
+### 1. Build
 
 ```bash
 go build -o dora-metrics .
 ```
 
-### 2. 環境変数の設定
+### 2. Configure Environment Variables
 
 ```bash
 cp .env.example .env
 vim .env
 ```
 
-### 3. GitHub Token の取得
+### 3. Get GitHub Token
 
-[GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens) から、以下の権限を持つトークンを作成:
+Create a token at [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens) with the following permissions:
 
-- `repo` (プライベートリポジトリの場合)
-- `public_repo` (パブリックリポジトリのみの場合)
+- `repo` (for private repositories)
+- `public_repo` (for public repositories only)
 
-## 設定項目
+## Configuration
 
-### .env ファイル
+### .env File
 
 ```bash
-# GitHub API Token (必須)
+# GitHub API Token (required)
 GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
 
-# GitHub Organization or User (必須)
+# GitHub Organization or User (required)
 GITHUB_OWNER=your-org
 
-# リポジトリ名 (カンマ区切り、必須)
+# Repository names (comma-separated, required)
 GITHUB_REPOS=repo1,repo2,repo3
 
-# チームメンバー (カンマ区切り、任意)
-# 指定しない場合は全コントリビューターが対象
+# Team members (comma-separated, optional)
+# If not specified, all contributors are included
 GITHUB_MEMBERS=user1,user2,user3
 
-# 計測期間 (YYYY-MM-DD形式、必須)
+# Analysis period (YYYY-MM-DD format, required)
 DORA_FROM=2025-01-01
 DORA_TO=2025-01-31
 ```
 
-## 使い方
+## Usage
 
-### 基本
+### Basic
 
 ```bash
-# .env に設定済みなら期間だけ指定
+# If .env is configured, just specify the period
 ./dora-metrics --from 2025-01-01 --to 2025-01-31
 ```
 
-### コマンドライン引数で全て指定
+### Specify All Options via Command Line
 
 ```bash
 ./dora-metrics \
@@ -85,7 +85,7 @@ DORA_TO=2025-01-31
   --token ghp_xxxx
 ```
 
-### 単一リポジトリ
+### Single Repository
 
 ```bash
 ./dora-metrics \
@@ -95,10 +95,10 @@ DORA_TO=2025-01-31
   --to 2025-01-31
 ```
 
-### 全コントリビューター対象
+### All Contributors
 
 ```bash
-# --members を省略すると全員が対象
+# Omit --members to include all contributors
 ./dora-metrics \
   --owner your-org \
   --repos repo1 \
@@ -106,18 +106,18 @@ DORA_TO=2025-01-31
   --to 2025-01-31
 ```
 
-## オプション一覧
+## Options
 
-| オプション | 環境変数 | 説明 | 必須 |
-|-----------|----------|------|------|
-| `--owner` | `GITHUB_OWNER` | GitHub Organization または User | Yes |
-| `--repos` | `GITHUB_REPOS` | リポジトリ名 (カンマ区切り) | Yes |
-| `--from` | `DORA_FROM` | 開始日 (YYYY-MM-DD) | Yes |
-| `--to` | `DORA_TO` | 終了日 (YYYY-MM-DD) | Yes |
-| `--members` | `GITHUB_MEMBERS` | フィルタ対象メンバー (カンマ区切り) | No |
+| Option | Environment Variable | Description | Required |
+|--------|---------------------|-------------|----------|
+| `--owner` | `GITHUB_OWNER` | GitHub Organization or User | Yes |
+| `--repos` | `GITHUB_REPOS` | Repository names (comma-separated) | Yes |
+| `--from` | `DORA_FROM` | Start date (YYYY-MM-DD) | Yes |
+| `--to` | `DORA_TO` | End date (YYYY-MM-DD) | Yes |
+| `--members` | `GITHUB_MEMBERS` | Filter by members (comma-separated) | No |
 | `--token` | `GITHUB_TOKEN` | GitHub API Token | Yes |
 
-## 出力例
+## Example Output
 
 ```
 🚀 DORA Metrics Calculator
@@ -169,22 +169,22 @@ DORA_TO=2025-01-31
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
-複数リポジトリを指定した場合、最後に Combined Summary も出力されます。
+When multiple repositories are specified, a Combined Summary is also displayed at the end.
 
-## Change Failure の判定基準
+## Change Failure Criteria
 
-以下のいずれかに該当するPRを障害対応PRとしてカウント:
+PRs matching any of the following are counted as failure PRs:
 
-1. **ブランチ名**: `hotfix` または `bugfix` を含む
-2. **ラベル**: `bug`, `hotfix`, `bugfix` を含む
-3. **Revertコミット**: mainブランチへの `Revert` で始まるコミット
+1. **Branch name**: Contains `hotfix` or `bugfix`
+2. **Labels**: Contains `bug`, `hotfix`, or `bugfix`
+3. **Revert commits**: Commits on main branch starting with `Revert`
 
-## 制限事項
+## Limitations
 
-- GitHub API のレート制限あり (認証済みで 5,000 req/hour)
-- 大量のPRがある場合、API呼び出しに時間がかかる場合があります
-- Time to Restore Service (MTTR) は本ツールでは計測していません
+- Subject to GitHub API rate limits (5,000 requests/hour for authenticated users)
+- API calls may take time for repositories with many PRs
+- Time to Restore Service (MTTR) is not measured in this tool
 
-## ライセンス
+## License
 
 MIT
