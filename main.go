@@ -2,693 +2,185 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
+	"log"
 	"os"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/go-github/v60/github"
 	"github.com/joho/godotenv"
+	"golang.org/x/oauth2"
 )
 
-const (
-	githubAPIBase = "https://api.github.com"
-)
-
-type Config struct {
-	Token   string
-	Owner   string
-	Repos   []string
-	Members []string
-	From    time.Time
-	To      time.Time
-}
-
-type PullRequest struct {
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	MergedAt  *time.Time `json:"merged_at"`
-	User      struct {
-		Login string `json:"login"`
-	} `json:"user"`
-	Head struct {
-		Ref string `json:"ref"`
-	} `json:"head"`
-	Labels []struct {
-		Name string `json:"name"`
-	} `json:"labels"`
-}
-
-type Review struct {
-	ID          int       `json:"id"`
-	User        struct {
-		Login string `json:"login"`
-	} `json:"user"`
-	State       string    `json:"state"`
-	SubmittedAt time.Time `json:"submitted_at"`
-}
-
-type Commit struct {
-	SHA    string `json:"sha"`
-	Commit struct {
-		Message string `json:"message"`
-		Author  struct {
-			Date time.Time `json:"date"`
-		} `json:"author"`
-	} `json:"commit"`
-}
-
-type PRCommit struct {
-	SHA    string `json:"sha"`
-	Commit struct {
-		Author struct {
-			Date time.Time `json:"date"`
-		} `json:"author"`
-	} `json:"commit"`
-}
-
-type Metrics struct {
-	Repo                    string
-	Period                  string
-	Days                    int
-	DeploymentFrequency     float64
-	DeploymentsTotal        int
-	LeadTimeForChanges      time.Duration
-	LeadTimeMedian          time.Duration
-	ChangeFailureRate       float64
-	FailureCount            int
-	TimeToFirstReview       time.Duration
-	TimeToFirstReviewMedian time.Duration
-	PRsAnalyzed             int
-	MemberMetrics           map[string]*MemberMetrics
-}
-
-type MemberMetrics struct {
-	Username            string
-	PRsMerged           int
-	AvgLeadTime         time.Duration
-	MedianLeadTime      time.Duration
-	AvgTimeToFirstReview time.Duration
-	MedianTimeToFirstReview time.Duration
-	FailurePRs          int
-	LeadTimes           []time.Duration
-	FirstReviewTimes    []time.Duration
-}
-
-type Client struct {
-	httpClient *http.Client
-	token      string
-}
-
-func NewClient(token string) *Client {
-	return &Client{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		token:      token,
-	}
-}
-
-func (c *Client) doRequest(ctx context.Context, url string, result interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API error: %s (status %d)", url, resp.StatusCode)
-	}
-
-	return json.NewDecoder(resp.Body).Decode(result)
-}
-
-func (c *Client) fetchAllPages(ctx context.Context, baseURL string, perPage int, result interface{}) error {
-	// This is a simplified version - for production, implement proper pagination
-	url := fmt.Sprintf("%s?per_page=%d&state=all", baseURL, perPage)
-	return c.doRequest(ctx, url, result)
-}
-
-func (c *Client) GetMergedPRs(ctx context.Context, owner, repo string, since, until time.Time, members []string) ([]PullRequest, error) {
-	memberSet := make(map[string]bool)
-	for _, m := range members {
-		memberSet[strings.ToLower(m)] = true
-	}
-
-	var allPRs []PullRequest
-	page := 1
-	perPage := 100
-
-	for {
-		url := fmt.Sprintf("%s/repos/%s/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d&page=%d",
-			githubAPIBase, owner, repo, perPage, page)
-
-		var prs []PullRequest
-		if err := c.doRequest(ctx, url, &prs); err != nil {
-			return nil, err
-		}
-
-		if len(prs) == 0 {
-			break
-		}
-
-		foundOld := false
-		for _, pr := range prs {
-			if pr.MergedAt == nil {
-				continue
-			}
-			if pr.MergedAt.Before(since) {
-				foundOld = true
-				continue
-			}
-			if pr.MergedAt.After(until) {
-				continue
-			}
-			// Filter by members if specified
-			if len(members) > 0 && !memberSet[strings.ToLower(pr.User.Login)] {
-				continue
-			}
-			allPRs = append(allPRs, pr)
-		}
-
-		if foundOld || len(prs) < perPage {
-			break
-		}
-		page++
-	}
-
-	return allPRs, nil
-}
-
-func (c *Client) GetPRCommits(ctx context.Context, owner, repo string, prNumber int) ([]PRCommit, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/commits?per_page=100",
-		githubAPIBase, owner, repo, prNumber)
-
-	var commits []PRCommit
-	if err := c.doRequest(ctx, url, &commits); err != nil {
-		return nil, err
-	}
-	return commits, nil
-}
-
-func (c *Client) GetPRReviews(ctx context.Context, owner, repo string, prNumber int) ([]Review, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews",
-		githubAPIBase, owner, repo, prNumber)
-
-	var reviews []Review
-	if err := c.doRequest(ctx, url, &reviews); err != nil {
-		return nil, err
-	}
-	return reviews, nil
-}
-
-func (c *Client) GetRecentCommits(ctx context.Context, owner, repo, branch string, since time.Time) ([]Commit, error) {
-	var allCommits []Commit
-	page := 1
-	perPage := 100
-
-	for {
-		url := fmt.Sprintf("%s/repos/%s/%s/commits?sha=%s&since=%s&per_page=%d&page=%d",
-			githubAPIBase, owner, repo, branch, since.Format(time.RFC3339), perPage, page)
-
-		var commits []Commit
-		if err := c.doRequest(ctx, url, &commits); err != nil {
-			return nil, err
-		}
-
-		if len(commits) == 0 {
-			break
-		}
-
-		allCommits = append(allCommits, commits...)
-
-		if len(commits) < perPage {
-			break
-		}
-		page++
-	}
-
-	return allCommits, nil
-}
-
-func isFailurePR(pr PullRequest) bool {
-	// Check branch name
-	branchLower := strings.ToLower(pr.Head.Ref)
-	if strings.HasPrefix(branchLower, "hotfix") || strings.HasPrefix(branchLower, "bugfix") ||
-		strings.Contains(branchLower, "hotfix") || strings.Contains(branchLower, "bugfix") {
-		return true
-	}
-
-	// Check labels
-	for _, label := range pr.Labels {
-		labelLower := strings.ToLower(label.Name)
-		if labelLower == "bug" || labelLower == "hotfix" || labelLower == "bugfix" ||
-			strings.Contains(labelLower, "bug") || strings.Contains(labelLower, "hotfix") {
-			return true
-		}
-	}
-
-	return false
-}
-
-func isRevertCommit(commit Commit) bool {
-	msg := strings.ToLower(commit.Commit.Message)
-	return strings.HasPrefix(msg, "revert")
-}
-
-func median(durations []time.Duration) time.Duration {
-	if len(durations) == 0 {
-		return 0
-	}
-	sorted := make([]time.Duration, len(durations))
-	copy(sorted, durations)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
-	mid := len(sorted) / 2
-	if len(sorted)%2 == 0 {
-		return (sorted[mid-1] + sorted[mid]) / 2
-	}
-	return sorted[mid]
-}
-
-func average(durations []time.Duration) time.Duration {
-	if len(durations) == 0 {
-		return 0
-	}
-	var total time.Duration
-	for _, d := range durations {
-		total += d
-	}
-	return total / time.Duration(len(durations))
-}
-
-func calculateMetrics(ctx context.Context, client *Client, cfg Config, repo string) (*Metrics, error) {
-	since := cfg.From
-	until := cfg.To
-
-	fmt.Printf("\n📊 Analyzing %s/%s...\n", cfg.Owner, repo)
-
-	// Get merged PRs
-	prs, err := client.GetMergedPRs(ctx, cfg.Owner, repo, since, until, cfg.Members)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get PRs: %w", err)
-	}
-	fmt.Printf("   Found %d merged PRs\n", len(prs))
-
-	// Get commits on main for revert detection
-	commits, err := client.GetRecentCommits(ctx, cfg.Owner, repo, "main", since)
-	if err != nil {
-		// Try master if main doesn't exist
-		commits, err = client.GetRecentCommits(ctx, cfg.Owner, repo, "master", since)
-		if err != nil {
-			fmt.Printf("   Warning: Could not fetch commits: %v\n", err)
-			commits = []Commit{}
-		}
-	}
-
-	// Count reverts
-	revertCount := 0
-	for _, c := range commits {
-		if isRevertCommit(c) {
-			revertCount++
-		}
-	}
-
-	periodDays := int(until.Sub(since).Hours()/24) + 1
-	metrics := &Metrics{
-		Repo:          repo,
-		Period:        fmt.Sprintf("%s ~ %s", since.Format("2006-01-02"), until.Format("2006-01-02")),
-		Days:          periodDays,
-		MemberMetrics: make(map[string]*MemberMetrics),
-	}
-
-	// Initialize member metrics
-	for _, member := range cfg.Members {
-		metrics.MemberMetrics[strings.ToLower(member)] = &MemberMetrics{
-			Username: member,
-		}
-	}
-
-	var leadTimes []time.Duration
-	var firstReviewTimes []time.Duration
-	failureCount := 0
-
-	for i, pr := range prs {
-		if (i+1)%10 == 0 {
-			fmt.Printf("   Processing PR %d/%d...\n", i+1, len(prs))
-		}
-
-		memberKey := strings.ToLower(pr.User.Login)
-		memberMetric, ok := metrics.MemberMetrics[memberKey]
-		if !ok {
-			memberMetric = &MemberMetrics{Username: pr.User.Login}
-			metrics.MemberMetrics[memberKey] = memberMetric
-		}
-		memberMetric.PRsMerged++
-
-		// Calculate lead time (first commit to merge)
-		prCommits, err := client.GetPRCommits(ctx, cfg.Owner, repo, pr.Number)
-		if err != nil {
-			fmt.Printf("   Warning: Could not get commits for PR #%d: %v\n", pr.Number, err)
-			continue
-		}
-
-		if len(prCommits) > 0 && pr.MergedAt != nil {
-			firstCommitTime := prCommits[0].Commit.Author.Date
-			for _, c := range prCommits {
-				if c.Commit.Author.Date.Before(firstCommitTime) {
-					firstCommitTime = c.Commit.Author.Date
-				}
-			}
-			leadTime := pr.MergedAt.Sub(firstCommitTime)
-			leadTimes = append(leadTimes, leadTime)
-			memberMetric.LeadTimes = append(memberMetric.LeadTimes, leadTime)
-		}
-
-		// Calculate time to first review
-		reviews, err := client.GetPRReviews(ctx, cfg.Owner, repo, pr.Number)
-		if err != nil {
-			fmt.Printf("   Warning: Could not get reviews for PR #%d: %v\n", pr.Number, err)
-		} else if len(reviews) > 0 {
-			// Find first review (excluding author's own reviews)
-			var firstReviewTime *time.Time
-			for _, review := range reviews {
-				if strings.ToLower(review.User.Login) == strings.ToLower(pr.User.Login) {
-					continue
-				}
-				if firstReviewTime == nil || review.SubmittedAt.Before(*firstReviewTime) {
-					t := review.SubmittedAt
-					firstReviewTime = &t
-				}
-			}
-			if firstReviewTime != nil {
-				timeToFirstReview := firstReviewTime.Sub(pr.CreatedAt)
-				firstReviewTimes = append(firstReviewTimes, timeToFirstReview)
-				memberMetric.FirstReviewTimes = append(memberMetric.FirstReviewTimes, timeToFirstReview)
-			}
-		}
-
-		// Check for failure
-		if isFailurePR(pr) {
-			failureCount++
-			memberMetric.FailurePRs++
-		}
-	}
-
-	// Calculate aggregate metrics
-	days := int(cfg.To.Sub(cfg.From).Hours()/24) + 1
-	metrics.DeploymentsTotal = len(prs)
-	metrics.DeploymentFrequency = float64(len(prs)) / float64(days)
-	metrics.LeadTimeForChanges = average(leadTimes)
-	metrics.LeadTimeMedian = median(leadTimes)
-	metrics.FailureCount = failureCount + revertCount
-	if len(prs) > 0 {
-		metrics.ChangeFailureRate = float64(failureCount+revertCount) / float64(len(prs)) * 100
-	}
-	metrics.TimeToFirstReview = average(firstReviewTimes)
-	metrics.TimeToFirstReviewMedian = median(firstReviewTimes)
-	metrics.PRsAnalyzed = len(prs)
-
-	// Calculate member-level metrics
-	for _, mm := range metrics.MemberMetrics {
-		mm.AvgLeadTime = average(mm.LeadTimes)
-		mm.MedianLeadTime = median(mm.LeadTimes)
-		mm.AvgTimeToFirstReview = average(mm.FirstReviewTimes)
-		mm.MedianTimeToFirstReview = median(mm.FirstReviewTimes)
-	}
-
-	return metrics, nil
-}
-
-func formatDuration(d time.Duration) string {
-	if d == 0 {
-		return "N/A"
-	}
-	hours := d.Hours()
-	if hours < 24 {
-		return fmt.Sprintf("%.1f hours", hours)
-	}
-	days := hours / 24
-	return fmt.Sprintf("%.1f days", days)
-}
-
-func printMetrics(metrics *Metrics) {
-	fmt.Printf("\n")
-	fmt.Printf("╔══════════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║  DORA Metrics: %s\n", metrics.Repo)
-	fmt.Printf("║  Period: %s\n", metrics.Period)
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-	fmt.Printf("║\n")
-	fmt.Printf("║  📦 Deployment Frequency\n")
-	fmt.Printf("║     Total Deployments: %d\n", metrics.DeploymentsTotal)
-	fmt.Printf("║     Frequency: %.2f deploys/day (%.1f deploys/week)\n",
-		metrics.DeploymentFrequency, metrics.DeploymentFrequency*7)
-	fmt.Printf("║\n")
-	fmt.Printf("║  ⏱️  Lead Time for Changes (first commit → merge)\n")
-	fmt.Printf("║     Average: %s\n", formatDuration(metrics.LeadTimeForChanges))
-	fmt.Printf("║     Median:  %s\n", formatDuration(metrics.LeadTimeMedian))
-	fmt.Printf("║\n")
-	fmt.Printf("║  🔥 Change Failure Rate\n")
-	fmt.Printf("║     Failure PRs + Reverts: %d\n", metrics.FailureCount)
-	fmt.Printf("║     Rate: %.1f%%\n", metrics.ChangeFailureRate)
-	fmt.Printf("║\n")
-	fmt.Printf("║  👀 Time to First Review (PR created → first review)\n")
-	fmt.Printf("║     Average: %s\n", formatDuration(metrics.TimeToFirstReview))
-	fmt.Printf("║     Median:  %s\n", formatDuration(metrics.TimeToFirstReviewMedian))
-	fmt.Printf("║\n")
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-	fmt.Printf("║  👥 Per-Member Breakdown\n")
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-
-	for _, mm := range metrics.MemberMetrics {
-		if mm.PRsMerged == 0 {
-			continue
-		}
-		fmt.Printf("║\n")
-		fmt.Printf("║  @%s\n", mm.Username)
-		fmt.Printf("║     PRs Merged: %d\n", mm.PRsMerged)
-		fmt.Printf("║     Lead Time (avg/median): %s / %s\n",
-			formatDuration(mm.AvgLeadTime), formatDuration(mm.MedianLeadTime))
-		fmt.Printf("║     Time to First Review (avg/median): %s / %s\n",
-			formatDuration(mm.AvgTimeToFirstReview), formatDuration(mm.MedianTimeToFirstReview))
-		fmt.Printf("║     Failure PRs: %d\n", mm.FailurePRs)
-	}
-
-	fmt.Printf("║\n")
-	fmt.Printf("╚══════════════════════════════════════════════════════════════════╝\n")
-}
-
-func printSummary(allMetrics []*Metrics) {
-	fmt.Printf("\n")
-	fmt.Printf("╔══════════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║  📊 COMBINED SUMMARY (All Repositories)\n")
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-
-	var totalDeploys int
-	var totalFailures int
-	var allLeadTimes []time.Duration
-	var allFirstReviewTimes []time.Duration
-	combinedMembers := make(map[string]*MemberMetrics)
-	days := 0
-	if len(allMetrics) > 0 {
-		days = allMetrics[0].Days
-	}
-
-	for _, m := range allMetrics {
-		totalDeploys += m.DeploymentsTotal
-		totalFailures += m.FailureCount
-
-		for key, mm := range m.MemberMetrics {
-			if _, ok := combinedMembers[key]; !ok {
-				combinedMembers[key] = &MemberMetrics{Username: mm.Username}
-			}
-			combinedMembers[key].PRsMerged += mm.PRsMerged
-			combinedMembers[key].FailurePRs += mm.FailurePRs
-			combinedMembers[key].LeadTimes = append(combinedMembers[key].LeadTimes, mm.LeadTimes...)
-			combinedMembers[key].FirstReviewTimes = append(combinedMembers[key].FirstReviewTimes, mm.FirstReviewTimes...)
-			allLeadTimes = append(allLeadTimes, mm.LeadTimes...)
-			allFirstReviewTimes = append(allFirstReviewTimes, mm.FirstReviewTimes...)
-		}
-	}
-
-	// Calculate combined member metrics
-	for _, mm := range combinedMembers {
-		mm.AvgLeadTime = average(mm.LeadTimes)
-		mm.MedianLeadTime = median(mm.LeadTimes)
-		mm.AvgTimeToFirstReview = average(mm.FirstReviewTimes)
-		mm.MedianTimeToFirstReview = median(mm.FirstReviewTimes)
-	}
-
-	fmt.Printf("║\n")
-	fmt.Printf("║  📦 Deployment Frequency (All Repos)\n")
-	fmt.Printf("║     Total Deployments: %d\n", totalDeploys)
-	fmt.Printf("║     Frequency: %.2f deploys/day (%.1f deploys/week)\n",
-		float64(totalDeploys)/float64(days), float64(totalDeploys)/float64(days)*7)
-	fmt.Printf("║\n")
-	fmt.Printf("║  ⏱️  Lead Time for Changes (All Repos)\n")
-	fmt.Printf("║     Average: %s\n", formatDuration(average(allLeadTimes)))
-	fmt.Printf("║     Median:  %s\n", formatDuration(median(allLeadTimes)))
-	fmt.Printf("║\n")
-	fmt.Printf("║  🔥 Change Failure Rate (All Repos)\n")
-	fmt.Printf("║     Failures: %d / %d\n", totalFailures, totalDeploys)
-	if totalDeploys > 0 {
-		fmt.Printf("║     Rate: %.1f%%\n", float64(totalFailures)/float64(totalDeploys)*100)
-	}
-	fmt.Printf("║\n")
-	fmt.Printf("║  👀 Time to First Review (All Repos)\n")
-	fmt.Printf("║     Average: %s\n", formatDuration(average(allFirstReviewTimes)))
-	fmt.Printf("║     Median:  %s\n", formatDuration(median(allFirstReviewTimes)))
-	fmt.Printf("║\n")
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-	fmt.Printf("║  👥 Combined Per-Member Metrics\n")
-	fmt.Printf("╠══════════════════════════════════════════════════════════════════╣\n")
-
-	for _, mm := range combinedMembers {
-		if mm.PRsMerged == 0 {
-			continue
-		}
-		fmt.Printf("║\n")
-		fmt.Printf("║  @%s\n", mm.Username)
-		fmt.Printf("║     PRs Merged: %d\n", mm.PRsMerged)
-		fmt.Printf("║     Lead Time (avg/median): %s / %s\n",
-			formatDuration(mm.AvgLeadTime), formatDuration(mm.MedianLeadTime))
-		fmt.Printf("║     Time to First Review (avg/median): %s / %s\n",
-			formatDuration(mm.AvgTimeToFirstReview), formatDuration(mm.MedianTimeToFirstReview))
-		fmt.Printf("║     Failure PRs: %d\n", mm.FailurePRs)
-	}
-
-	fmt.Printf("║\n")
-	fmt.Printf("╚══════════════════════════════════════════════════════════════════╝\n")
+type Stats struct {
+	TotalPRs       int
+	TotalLeadTime  time.Duration
+	BugFixPRs      int
+	TotalAdditions int
+	TotalDeletions int
 }
 
 func main() {
-	// Load .env file (optional - won't error if not found)
 	_ = godotenv.Load()
 
-	// Define flags with defaults from environment variables
-	owner := flag.String("owner", os.Getenv("GITHUB_OWNER"), "GitHub organization or user (required)")
-	repos := flag.String("repos", os.Getenv("GITHUB_REPOS"), "Comma-separated list of repository names (required)")
-	members := flag.String("members", os.Getenv("GITHUB_MEMBERS"), "Comma-separated list of GitHub usernames to filter (optional)")
-	fromStr := flag.String("from", os.Getenv("DORA_FROM"), "Start date (YYYY-MM-DD, required)")
-	toStr := flag.String("to", os.Getenv("DORA_TO"), "End date (YYYY-MM-DD, required)")
-	token := flag.String("token", "", "GitHub API token (or set GITHUB_TOKEN env var)")
-
+	ownerFlag := flag.String("owner", os.Getenv("TARGET_OWNER"), "GitHub Owner/Org name")
+	reposFlag := flag.String("repos", os.Getenv("TARGET_REPOS"), "Comma-separated repository names")
+	membersFlag := flag.String("members", os.Getenv("TARGET_MEMBERS"), "Comma-separated GitHub usernames to filter")
+	startFlag := flag.String("start", os.Getenv("DORA_FROM"), "Start date (YYYY-MM-DD)")
+	endFlag := flag.String("end", os.Getenv("DORA_TO"), "End date (YYYY-MM-DD)")
 	flag.Parse()
 
-	// Validate required flags
-	if *owner == "" {
-		fmt.Println("Error: --owner is required")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if *repos == "" {
-		fmt.Println("Error: --repos is required")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if *fromStr == "" {
-		fmt.Println("Error: --from is required (format: YYYY-MM-DD)")
-		flag.Usage()
-		os.Exit(1)
-	}
-	if *toStr == "" {
-		fmt.Println("Error: --to is required (format: YYYY-MM-DD)")
-		flag.Usage()
-		os.Exit(1)
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" || *ownerFlag == "" || *reposFlag == "" || *startFlag == "" || *endFlag == "" {
+		log.Fatal("❌ Error: Missing required parameters in .env or flags.")
 	}
 
-	// Parse dates
-	fromDate, err := time.Parse("2006-01-02", *fromStr)
-	if err != nil {
-		fmt.Printf("Error: Invalid --from date format: %v\n", err)
-		os.Exit(1)
-	}
-	toDate, err := time.Parse("2006-01-02", *toStr)
-	if err != nil {
-		fmt.Printf("Error: Invalid --to date format: %v\n", err)
-		os.Exit(1)
-	}
-	// Set toDate to end of day
-	toDate = toDate.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
-
-	if fromDate.After(toDate) {
-		fmt.Println("Error: --from date must be before --to date")
-		os.Exit(1)
-	}
-
-	// Get token from flag or env
-	apiToken := *token
-	if apiToken == "" {
-		apiToken = os.Getenv("GITHUB_TOKEN")
-	}
-	if apiToken == "" {
-		fmt.Println("Error: GitHub token required. Use --token flag or set GITHUB_TOKEN env var")
-		os.Exit(1)
-	}
-
-	// Parse repos and members
-	repoList := strings.Split(*repos, ",")
-	for i := range repoList {
-		repoList[i] = strings.TrimSpace(repoList[i])
-	}
-
-	var memberList []string
-	if *members != "" {
-		memberList = strings.Split(*members, ",")
-		for i := range memberList {
-			memberList[i] = strings.TrimSpace(memberList[i])
+	repos := strings.Split(*reposFlag, ",")
+	memberMap := make(map[string]bool)
+	if *membersFlag != "" {
+		for _, m := range strings.Split(*membersFlag, ",") {
+			memberMap[strings.TrimSpace(m)] = true
 		}
 	}
-
-	cfg := Config{
-		Token:   apiToken,
-		Owner:   *owner,
-		Repos:   repoList,
-		Members: memberList,
-		From:    fromDate,
-		To:      toDate,
-	}
-
-	fmt.Printf("🚀 DORA Metrics Calculator\n")
-	fmt.Printf("   Organization: %s\n", cfg.Owner)
-	fmt.Printf("   Repositories: %v\n", cfg.Repos)
-	if len(cfg.Members) > 0 {
-		fmt.Printf("   Members: %v\n", cfg.Members)
-	} else {
-		fmt.Printf("   Members: All contributors\n")
-	}
-	fmt.Printf("   Period: %s ~ %s\n", cfg.From.Format("2006-01-02"), cfg.To.Format("2006-01-02"))
 
 	ctx := context.Background()
-	client := NewClient(cfg.Token)
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
 
-	var allMetrics []*Metrics
+	teamStats := &Stats{}
+	repoStatsMap := make(map[string]*Stats)
+	userStatsMap := make(map[string]*Stats)
+	var mu sync.Mutex
 
-	for _, repo := range cfg.Repos {
-		metrics, err := calculateMetrics(ctx, client, cfg, repo)
-		if err != nil {
-			fmt.Printf("Error analyzing %s: %v\n", repo, err)
+	fmt.Printf("🚀 Analyzing: %s to %s\n", *startFlag, *endFlag)
+
+	for _, repoName := range repos {
+		repoName = strings.TrimSpace(repoName)
+		repoStats := &Stats{}
+		query := fmt.Sprintf("repo:%s/%s is:pr is:merged merged:%s..%s", *ownerFlag, repoName, *startFlag, *endFlag)
+		allIssues := fetchAllIssues(ctx, client, query)
+
+		if len(allIssues) == 0 {
+			repoStatsMap[repoName] = repoStats
 			continue
 		}
-		allMetrics = append(allMetrics, metrics)
-		printMetrics(metrics)
+
+		prChan := make(chan int, len(allIssues))
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for num := range prChan {
+					pr, _, err := client.PullRequests.Get(ctx, *ownerFlag, repoName, num)
+					if err != nil { continue }
+
+					author := pr.GetUser().GetLogin()
+					if len(memberMap) > 0 && !memberMap[author] { continue }
+
+					// --- 強化されたBug判定ロジック ---
+					isBug := false
+					title := strings.ToLower(pr.GetTitle())
+					branch := strings.ToLower(pr.GetHead().GetRef())
+
+					// 判定キーワード
+					keywords := []string{"bug", "fix", "hotfix", "defect", "incident", "不具合", "修正"}
+
+					// 1. ラベルチェック
+					for _, l := range pr.Labels {
+						labelName := strings.ToLower(l.GetName())
+						for _, k := range keywords {
+							if strings.Contains(labelName, k) { isBug = true; break }
+						}
+					}
+					// 2. タイトルチェック (ラベルで見つからなかった場合)
+					if !isBug {
+						for _, k := range keywords {
+							if strings.Contains(title, k) { isBug = true; break }
+						}
+					}
+					// 3. ブランチ名チェック
+					if !isBug {
+						for _, k := range keywords {
+							if strings.Contains(branch, k) { isBug = true; break }
+						}
+					}
+
+					// デバッグ出力: バグと判定されたPRを表示
+					if isBug {
+						fmt.Printf("  [BUG Detect] #%d: %s (Author: %s)\n", pr.GetNumber(), pr.GetTitle(), author)
+					}
+
+					lt := pr.GetMergedAt().Sub(pr.GetCreatedAt().Time)
+					mu.Lock()
+					if userStatsMap[author] == nil { userStatsMap[author] = &Stats{} }
+					update(teamStats, lt, isBug, pr.GetAdditions(), pr.GetDeletions())
+					update(repoStats, lt, isBug, pr.GetAdditions(), pr.GetDeletions())
+					update(userStatsMap[author], lt, isBug, pr.GetAdditions(), pr.GetDeletions())
+					mu.Unlock()
+				}
+			}()
+		}
+		for _, issue := range allIssues { prChan <- issue.GetNumber() }
+		close(prChan)
+		wg.Wait()
+		repoStatsMap[repoName] = repoStats
 	}
 
-	// Print combined summary if multiple repos
-	if len(allMetrics) > 1 {
-		printSummary(allMetrics)
+	displayResults(*startFlag, *endFlag, teamStats, repoStatsMap, userStatsMap)
+}
+
+// --- 以下、補助関数 ---
+func fetchAllIssues(ctx context.Context, client *github.Client, query string) []*github.Issue {
+	var allIssues []*github.Issue
+	opts := &github.SearchOptions{ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		result, resp, err := client.Search.Issues(ctx, query, opts)
+		if err != nil { return nil }
+		allIssues = append(allIssues, result.Issues...)
+		if resp.NextPage == 0 { break }
+		opts.Page = resp.NextPage
+	}
+	return allIssues
+}
+
+func update(s *Stats, lt time.Duration, isBug bool, add, del int) {
+	s.TotalPRs++
+	s.TotalLeadTime += lt
+	s.TotalAdditions += add
+	s.TotalDeletions += del
+	if isBug { s.BugFixPRs++ }
+}
+
+func displayResults(from, to string, team *Stats, repos map[string]*Stats, users map[string]*Stats) {
+	line := strings.Repeat("=", 85)
+	fmt.Printf("\n%s\n📊 DORA Metrics Summary (%s - %s)\n%s\n", line, from, to, line)
+
+	fmt.Println("[OVERALL TEAM]")
+	printRow("TOTAL", team)
+
+	fmt.Println("\n[BY REPOSITORY]")
+	for name, s := range repos {
+		printRow(name, s)
 	}
 
-	fmt.Printf("\n✅ Analysis complete!\n")
+	fmt.Println("\n[BY CONTRIBUTOR]")
+	for user, s := range users {
+		printRow(user, s)
+	}
+}
+
+func printRow(name string, s *Stats) {
+	avgLT, cfr, avgAdd := 0.0, 0.0, 0
+	if s.TotalPRs > 0 {
+		avgLT = s.TotalLeadTime.Hours() / float64(s.TotalPRs)
+		cfr = float64(s.BugFixPRs) / float64(s.TotalPRs) * 100
+		avgAdd = s.TotalAdditions / s.TotalPRs
+	}
+	fmt.Printf("%-25s | PRs: %3d | AvgLT: %5.1fh | CFR: %5.1f%% | AvgSize: +%d lines\n",
+		name, s.TotalPRs, avgLT, cfr, avgAdd)
 }
