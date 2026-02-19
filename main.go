@@ -18,9 +18,9 @@ import (
 type Stats struct {
 	TotalPRs       int
 	TotalLeadTime  time.Duration
-	BugFixPRs      int
+	BugFixPRs      int // "不具合修正/パッチ対応" を行った数
+	FeaturePRs     int // "新規・機能改善" を行った数
 	TotalAdditions int
-	TotalDeletions int
 }
 
 func main() {
@@ -35,7 +35,7 @@ func main() {
 
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" || *ownerFlag == "" || *reposFlag == "" || *startFlag == "" || *endFlag == "" {
-		log.Fatal("❌ Error: Missing required parameters in .env or flags.")
+		log.Fatal("❌ Error: Missing required parameters.")
 	}
 
 	repos := strings.Split(*reposFlag, ",")
@@ -82,45 +82,15 @@ func main() {
 					author := pr.GetUser().GetLogin()
 					if len(memberMap) > 0 && !memberMap[author] { continue }
 
-					// --- 強化されたBug判定ロジック ---
-					isBug := false
-					title := strings.ToLower(pr.GetTitle())
-					branch := strings.ToLower(pr.GetHead().GetRef())
-
-					// 判定キーワード
-					keywords := []string{"bug", "fix", "hotfix", "defect", "incident", "不具合", "修正"}
-
-					// 1. ラベルチェック
-					for _, l := range pr.Labels {
-						labelName := strings.ToLower(l.GetName())
-						for _, k := range keywords {
-							if strings.Contains(labelName, k) { isBug = true; break }
-						}
-					}
-					// 2. タイトルチェック (ラベルで見つからなかった場合)
-					if !isBug {
-						for _, k := range keywords {
-							if strings.Contains(title, k) { isBug = true; break }
-						}
-					}
-					// 3. ブランチ名チェック
-					if !isBug {
-						for _, k := range keywords {
-							if strings.Contains(branch, k) { isBug = true; break }
-						}
-					}
-
-					// デバッグ出力: バグと判定されたPRを表示
-					if isBug {
-						fmt.Printf("  [BUG Detect] #%d: %s (Author: %s)\n", pr.GetNumber(), pr.GetTitle(), author)
-					}
-
+					// Bug判定（タイトル、ラベル、ブランチ、セキュリティパッチ含む）
+					isFix := isBugFix(pr)
 					lt := pr.GetMergedAt().Sub(pr.GetCreatedAt().Time)
+
 					mu.Lock()
 					if userStatsMap[author] == nil { userStatsMap[author] = &Stats{} }
-					update(teamStats, lt, isBug, pr.GetAdditions(), pr.GetDeletions())
-					update(repoStats, lt, isBug, pr.GetAdditions(), pr.GetDeletions())
-					update(userStatsMap[author], lt, isBug, pr.GetAdditions(), pr.GetDeletions())
+					update(teamStats, lt, isFix, pr.GetAdditions())
+					update(repoStats, lt, isFix, pr.GetAdditions())
+					update(userStatsMap[author], lt, isFix, pr.GetAdditions())
 					mu.Unlock()
 				}
 			}()
@@ -134,7 +104,73 @@ func main() {
 	displayResults(*startFlag, *endFlag, teamStats, repoStatsMap, userStatsMap)
 }
 
-// --- 以下、補助関数 ---
+func isBugFix(pr *github.PullRequest) bool {
+	title := strings.ToLower(pr.GetTitle())
+	branch := strings.ToLower(pr.GetHead().GetRef())
+	keywords := []string{"bug", "fix", "hotfix", "defect", "incident", "patch", "security", "dependabot", "不具合", "修正"}
+
+	for _, l := range pr.Labels {
+		ln := strings.ToLower(l.GetName())
+		for _, k := range keywords {
+			if strings.Contains(ln, k) { return true }
+		}
+	}
+	for _, k := range keywords {
+		if strings.Contains(title, k) || strings.Contains(branch, k) { return true }
+	}
+	return false
+}
+
+func update(s *Stats, lt time.Duration, isFix bool, add int) {
+	s.TotalPRs++
+	s.TotalLeadTime += lt
+	s.TotalAdditions += add
+	if isFix {
+		s.BugFixPRs++
+	} else {
+		s.FeaturePRs++
+	}
+}
+
+func displayResults(from, to string, team *Stats, repos map[string]*Stats, users map[string]*Stats) {
+	line := strings.Repeat("-", 100)
+	fmt.Printf("\n%s\n📊 DORA & Contribution Summary (%s - %s)\n%s\n", line, from, to, line)
+
+	// チーム全体のDORA
+	fmt.Printf("%-25s | %-8s | %-10s | %-10s | %-10s\n", "ENTITY", "PRs", "AvgLT", "CFR", "AvgSize")
+	printRow("OVERALL TEAM", team, true)
+	fmt.Println(line)
+
+	// リポジトリ別
+	for name, s := range repos {
+		printRow(name, s, true)
+	}
+	fmt.Println(line)
+
+	// 個人別（見せ方を変える）
+	fmt.Printf("%-25s | %-8s | %-10s | %-15s | %-10s\n", "CONTRIBUTOR", "TotalPRs", "NewWork", "Fix/Maintenance", "AvgSize")
+	for user, s := range users {
+		newWork := s.FeaturePRs
+		fixes := s.BugFixPRs
+		avgSize := 0
+		if s.TotalPRs > 0 { avgSize = s.TotalAdditions / s.TotalPRs }
+
+		fmt.Printf("%-25s | %8d | %10d | %15d | +%d lines\n",
+			user, s.TotalPRs, newWork, fixes, avgSize)
+	}
+}
+
+func printRow(name string, s *Stats, showCFR bool) {
+	avgLT, cfr, avgAdd := 0.0, 0.0, 0
+	if s.TotalPRs > 0 {
+		avgLT = s.TotalLeadTime.Hours() / float64(s.TotalPRs)
+		cfr = float64(s.BugFixPRs) / float64(s.TotalPRs) * 100
+		avgAdd = s.TotalAdditions / s.TotalPRs
+	}
+	fmt.Printf("%-25s | %8d | %8.1fh | %8.1f%% | +%d\n",
+		name, s.TotalPRs, avgLT, cfr, avgAdd)
+}
+
 func fetchAllIssues(ctx context.Context, client *github.Client, query string) []*github.Issue {
 	var allIssues []*github.Issue
 	opts := &github.SearchOptions{ListOptions: github.ListOptions{PerPage: 100}}
@@ -146,41 +182,4 @@ func fetchAllIssues(ctx context.Context, client *github.Client, query string) []
 		opts.Page = resp.NextPage
 	}
 	return allIssues
-}
-
-func update(s *Stats, lt time.Duration, isBug bool, add, del int) {
-	s.TotalPRs++
-	s.TotalLeadTime += lt
-	s.TotalAdditions += add
-	s.TotalDeletions += del
-	if isBug { s.BugFixPRs++ }
-}
-
-func displayResults(from, to string, team *Stats, repos map[string]*Stats, users map[string]*Stats) {
-	line := strings.Repeat("=", 85)
-	fmt.Printf("\n%s\n📊 DORA Metrics Summary (%s - %s)\n%s\n", line, from, to, line)
-
-	fmt.Println("[OVERALL TEAM]")
-	printRow("TOTAL", team)
-
-	fmt.Println("\n[BY REPOSITORY]")
-	for name, s := range repos {
-		printRow(name, s)
-	}
-
-	fmt.Println("\n[BY CONTRIBUTOR]")
-	for user, s := range users {
-		printRow(user, s)
-	}
-}
-
-func printRow(name string, s *Stats) {
-	avgLT, cfr, avgAdd := 0.0, 0.0, 0
-	if s.TotalPRs > 0 {
-		avgLT = s.TotalLeadTime.Hours() / float64(s.TotalPRs)
-		cfr = float64(s.BugFixPRs) / float64(s.TotalPRs) * 100
-		avgAdd = s.TotalAdditions / s.TotalPRs
-	}
-	fmt.Printf("%-25s | PRs: %3d | AvgLT: %5.1fh | CFR: %5.1f%% | AvgSize: +%d lines\n",
-		name, s.TotalPRs, avgLT, cfr, avgAdd)
 }
